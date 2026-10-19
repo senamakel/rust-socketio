@@ -456,6 +456,23 @@ mod test {
     }
 
     #[test]
+    fn redirect_validation_rejects_local_tls_downgrade_to_remote_plaintext() {
+        let remote = Url::parse("http://remote.example/socket.io/").unwrap();
+        for local_tls in [
+            "https://localhost/socket.io/",
+            "https://127.0.0.1/socket.io/",
+            "https://[::1]/socket.io/",
+        ] {
+            let local_tls = Url::parse(local_tls).unwrap();
+            assert_eq!(
+                redirect_target_error(&local_tls, &remote, true),
+                Some("refusing credential-bearing TLS downgrade"),
+                "credential-bearing redirect from {local_tls} to remote plaintext must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn redirect_validation_rejects_unsupported_schemes_and_remote_credential_downgrade() {
         let from = Url::parse("https://service.example/socket.io/").unwrap();
         let plaintext = Url::parse("http://service.example/socket.io/").unwrap();
