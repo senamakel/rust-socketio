@@ -11,12 +11,15 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
+#[cfg(test)]
+use tokio::sync::Notify;
+
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
 use tokio::{
     runtime::Handle,
-    sync::{Mutex, Mutex as AsyncMutex, Notify},
+    sync::{Mutex, Mutex as AsyncMutex},
     task::{AbortHandle, JoinHandle},
     time::Instant,
 };
