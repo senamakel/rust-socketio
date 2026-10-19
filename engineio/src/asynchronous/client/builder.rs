@@ -25,6 +25,7 @@ pub struct ClientBuilder {
     connection_metadata: ConnectionMetadata,
     tls_config: Option<TlsConnector>,
     headers: Option<HeaderMap>,
+    has_credentials: bool,
     handshake: Option<HandshakePacket>,
     on_error: OptionalCallback<String>,
     on_open: OptionalCallback<()>,
@@ -51,6 +52,7 @@ impl ClientBuilder {
             },
             url,
             headers: None,
+            has_credentials: false,
             tls_config: None,
             handshake: None,
             on_close: OptionalCallback::default(),
@@ -70,6 +72,15 @@ impl ClientBuilder {
     /// Specify transport's HTTP headers
     pub fn headers(mut self, headers: HeaderMap) -> Self {
         self.headers = Some(headers);
+        self
+    }
+
+    /// Marks this connection as carrying credentials outside its HTTP headers.
+    ///
+    /// Higher-level protocols can send credentials after the Engine.IO
+    /// handshake, so redirect checks need to know about them before connecting.
+    pub fn credentials_present(mut self) -> Self {
+        self.has_credentials = true;
         self
     }
 
@@ -187,8 +198,12 @@ impl ClientBuilder {
         };
 
         // Start with polling transport
-        let mut transport =
-            PollingTransport::new(self.url.clone(), self.tls_config.clone(), headers);
+        let mut transport = PollingTransport::new_with_credentials(
+            self.url.clone(),
+            self.tls_config.clone(),
+            headers,
+            self.has_credentials,
+        );
 
         self.handshake_with_transport(&mut transport).await
     }
@@ -210,11 +225,12 @@ impl ClientBuilder {
         let redirect_budget = self.remaining_redirect_budget();
 
         // Make a polling transport with new sid
-        let transport = PollingTransport::new_with_redirect_budget(
+        let transport = PollingTransport::new_with_redirect_budget_and_credentials(
             self.url,
             self.tls_config,
             self.headers.map(|v| v.try_into().unwrap()),
             redirect_budget,
+            self.has_credentials,
         );
 
         // SAFETY: handshake function called previously.
@@ -254,10 +270,11 @@ impl ClientBuilder {
 
         match self.url.scheme() {
             "http" | "ws" => {
-                let mut transport = WebsocketTransport::new_with_redirect_budget(
+                let mut transport = WebsocketTransport::new_with_credentials_and_redirect_budget(
                     self.url.clone(),
                     headers,
                     redirect_budget,
+                    self.has_credentials,
                 )
                 .await?;
 
@@ -283,13 +300,15 @@ impl ClientBuilder {
                 ))
             }
             "https" | "wss" => {
-                let mut transport = WebsocketSecureTransport::new_with_redirect_budget(
-                    self.url.clone(),
-                    self.tls_config.clone(),
-                    headers,
-                    redirect_budget,
-                )
-                .await?;
+                let mut transport =
+                    WebsocketSecureTransport::new_with_credentials_and_redirect_budget(
+                        self.url.clone(),
+                        self.tls_config.clone(),
+                        headers,
+                        redirect_budget,
+                        self.has_credentials,
+                    )
+                    .await?;
 
                 if self.handshake.is_some() {
                     transport.upgrade().await?;
@@ -374,6 +393,20 @@ mod tests {
         assert_eq!(
             builder.url.as_str(),
             "https://example.test/socket.io/?EIO=4&transport=websocket&token=a"
+        );
+    }
+
+    #[test]
+    fn namespace_auth_presence_marks_remote_tls_redirect_as_credential_bearing() {
+        let builder =
+            ClientBuilder::new(Url::parse("https://socket.example.test/socket.io/").unwrap())
+                .credentials_present();
+        let from = Url::parse("https://socket.example.test/socket.io/").unwrap();
+        let to = Url::parse("http://redirect.example.test/socket.io/").unwrap();
+
+        assert_eq!(
+            super::super::super::redirect_target_error(&from, &to, builder.has_credentials),
+            Some("refusing credential-bearing TLS downgrade")
         );
     }
 

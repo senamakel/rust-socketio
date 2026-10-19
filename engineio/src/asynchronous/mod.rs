@@ -55,7 +55,7 @@ pub(crate) fn redirect_target_error(
     };
     let from_tls = matches!(from.scheme(), "https" | "wss");
     let to_plaintext = matches!(to.scheme(), "http" | "ws");
-    if credential_bearing && is_remote(from) && from_tls && to_plaintext {
+    if credential_bearing && (is_remote(from) || is_remote(to)) && from_tls && to_plaintext {
         return Some("refusing credential-bearing TLS downgrade");
     }
     None

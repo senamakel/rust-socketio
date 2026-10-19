@@ -446,6 +446,20 @@ impl ClientBuilder {
 
     /// Creates a new Socket that can be used for reconnections
     pub(crate) async fn inner_create(&self) -> Result<InnerSocket> {
+        let builder = self.engineio_builder()?;
+
+        let engine_client = match self.transport_type {
+            TransportType::Any => builder.build_with_fallback().await?,
+            TransportType::Polling => builder.build_polling().await?,
+            TransportType::Websocket => builder.build_websocket().await?,
+            TransportType::WebsocketUpgrade => builder.build_websocket_with_upgrade().await?,
+        };
+
+        let inner_socket = InnerSocket::new(engine_client)?;
+        Ok(inner_socket)
+    }
+
+    fn engineio_builder(&self) -> Result<EngineIoClientBuilder> {
         let mut url = Url::parse(&self.address)?;
 
         if url.path() == "/" {
@@ -460,16 +474,10 @@ impl ClientBuilder {
         if let Some(headers) = &self.opening_headers {
             builder = builder.headers(headers.to_owned());
         }
-
-        let engine_client = match self.transport_type {
-            TransportType::Any => builder.build_with_fallback().await?,
-            TransportType::Polling => builder.build_polling().await?,
-            TransportType::Websocket => builder.build_websocket().await?,
-            TransportType::WebsocketUpgrade => builder.build_websocket_with_upgrade().await?,
-        };
-
-        let inner_socket = InnerSocket::new(engine_client)?;
-        Ok(inner_socket)
+        if self.auth.is_some() {
+            builder = builder.credentials_present();
+        }
+        Ok(builder)
     }
 
     //TODO: 0.3.X stabilize
@@ -480,5 +488,237 @@ impl ClientBuilder {
         socket.connect().await?;
 
         Ok(socket)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener as StdTcpListener,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
+        thread,
+        time::Duration,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
+
+    const TLS_DOWNGRADE_ERROR: &str = "refusing credential-bearing TLS downgrade";
+    const SYNTHETIC_AUTH: &str = "socket-auth-canary-test-only";
+
+    fn local_tls_redirect_fixture(
+        target_port: u16,
+        upgrade_after_polling_handshake: bool,
+        remote_logical_origin: bool,
+    ) -> (String, thread::JoinHandle<()>) {
+        let origin_host = if remote_logical_origin {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
+        let listener = StdTcpListener::bind(format!("{origin_host}:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cert_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ci/cert/server.crt");
+        let key_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ci/cert/server.key");
+        let cert = fs::read(cert_path).expect("run `make keys` before TLS fixture tests");
+        let key = fs::read(key_path).expect("run `make keys` before TLS fixture tests");
+        let identity = native_tls::Identity::from_pkcs8(&cert, &key).unwrap();
+        let acceptor = native_tls::TlsAcceptor::new(identity).unwrap();
+        let expected_requests = if upgrade_after_polling_handshake {
+            2
+        } else {
+            1
+        };
+
+        let server = thread::spawn(move || {
+            for request_number in 0..expected_requests {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut stream = acceptor.accept(stream).unwrap();
+                let _request = read_http_headers(&mut stream);
+
+                if upgrade_after_polling_handshake && request_number == 0 {
+                    let body = "0{\"sid\":\"auth-redirect-test\",\"upgrades\":[\"websocket\"],\"pingInterval\":60000,\"pingTimeout\":60000,\"maxPayload\":1000000}";
+                    write_http_response(&mut stream, "200 OK", None, body);
+                } else {
+                    let location = format!("http://127.0.0.1:{target_port}/redirected/socket.io/");
+                    write_http_response(&mut stream, "302 Found", Some(&location), "");
+                }
+            }
+        });
+
+        (format!("https://{origin_host}:{port}/socket.io/"), server)
+    }
+
+    fn read_http_headers(stream: &mut impl Read) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).unwrap();
+            assert_ne!(count, 0, "peer closed before request headers arrived");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        request
+    }
+
+    fn write_http_response(
+        stream: &mut impl Write,
+        status: &str,
+        location: Option<&str>,
+        body: &str,
+    ) {
+        let location_header = location
+            .map(|location| format!("Location: {location}\r\n"))
+            .unwrap_or_default();
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\n{location_header}Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+
+    async fn plaintext_target_fixture(
+        status: &'static str,
+        body: &'static str,
+    ) -> (u16, Arc<AtomicBool>, Arc<Mutex<Vec<u8>>>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let captured_request = Arc::new(Mutex::new(Vec::new()));
+        let task_accepted = accepted.clone();
+        let task_capture = captured_request.clone();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            task_accepted.store(true, Ordering::SeqCst);
+            let mut request = Vec::new();
+            let mut chunk = [0; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            *task_capture.lock().unwrap() = request;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        (port, accepted, captured_request, task)
+    }
+
+    fn tls_client_config() -> native_tls::TlsConnector {
+        native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .unwrap()
+    }
+
+    async fn assert_authenticated_redirect_is_rejected(transport_type: TransportType) {
+        let (target_port, target_accepted, captured_request, target_task) =
+            plaintext_target_fixture("400 Bad Request", "").await;
+        let upgrade_after_polling_handshake = transport_type == TransportType::WebsocketUpgrade;
+        let (url, origin_server) =
+            local_tls_redirect_fixture(target_port, upgrade_after_polling_handshake, true);
+        let source = Url::parse(&url).unwrap();
+        assert!(!source
+            .host_str()
+            .unwrap()
+            .parse::<std::net::IpAddr>()
+            .unwrap()
+            .is_loopback());
+
+        let result = ClientBuilder::new(url)
+            .auth(json!({ "token": SYNTHETIC_AUTH }))
+            .tls_config(tls_client_config())
+            .transport_type(transport_type)
+            .connect_manual()
+            .await;
+        let rejection = match result {
+            Err(crate::error::Error::IncompleteResponseFromEngineIo(
+                rust_engineio::Error::InvalidHandshake(message),
+            )) => Some(message),
+            Err(error) => Some(format!("{error:?}")),
+            Ok(_) => None,
+        };
+
+        if !target_task.is_finished() {
+            target_task.abort();
+        }
+        let _ = target_task.await;
+        origin_server.join().unwrap();
+
+        assert_eq!(rejection.as_deref(), Some(TLS_DOWNGRADE_ERROR));
+        assert!(!target_accepted.load(Ordering::SeqCst));
+        assert!(captured_request.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn namespace_auth_marks_engineio_builder_credential_bearing() {
+        let builder = ClientBuilder::new("https://socket.example.test/socket.io/")
+            .auth(json!({"token": "local-fixture"}));
+
+        let engineio_builder = builder.engineio_builder().unwrap();
+        assert!(format!("{engineio_builder:?}").contains("has_credentials: true"));
+    }
+
+    #[tokio::test]
+    async fn namespace_auth_rejects_polling_tls_redirect_before_plaintext_request() {
+        assert_authenticated_redirect_is_rejected(TransportType::Polling).await;
+    }
+
+    #[tokio::test]
+    async fn namespace_auth_rejects_direct_websocket_tls_redirect_before_plaintext_request() {
+        assert_authenticated_redirect_is_rejected(TransportType::Websocket).await;
+    }
+
+    #[tokio::test]
+    async fn namespace_auth_rejects_websocket_upgrade_tls_redirect_before_plaintext_request() {
+        assert_authenticated_redirect_is_rejected(TransportType::WebsocketUpgrade).await;
+    }
+
+    #[tokio::test]
+    async fn namespace_auth_keeps_local_tls_to_plaintext_redirect_allowance() {
+        let handshake = "0{\"sid\":\"local-auth-redirect-test\",\"upgrades\":[],\"pingInterval\":60000,\"pingTimeout\":60000,\"maxPayload\":1000000}";
+        let (target_port, target_accepted, captured_request, target_task) =
+            plaintext_target_fixture("200 OK", handshake).await;
+        let (url, origin_server) = local_tls_redirect_fixture(target_port, false, false);
+
+        let engineio_builder = ClientBuilder::new(url)
+            .auth(json!({ "token": SYNTHETIC_AUTH }))
+            .tls_config(tls_client_config())
+            .engineio_builder()
+            .unwrap();
+        let result = engineio_builder.build_polling().await;
+        if let Ok(client) = result {
+            drop(client);
+        } else {
+            panic!("local plaintext redirect should remain allowed: {result:?}");
+        }
+
+        assert!(target_task.is_finished());
+        target_task.await.unwrap();
+        origin_server.join().unwrap();
+        assert!(target_accepted.load(Ordering::SeqCst));
+        assert!(!captured_request.lock().unwrap().is_empty());
     }
 }
