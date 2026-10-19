@@ -446,6 +446,20 @@ impl ClientBuilder {
 
     /// Creates a new Socket that can be used for reconnections
     pub(crate) async fn inner_create(&self) -> Result<InnerSocket> {
+        let builder = self.engineio_builder()?;
+
+        let engine_client = match self.transport_type {
+            TransportType::Any => builder.build_with_fallback().await?,
+            TransportType::Polling => builder.build_polling().await?,
+            TransportType::Websocket => builder.build_websocket().await?,
+            TransportType::WebsocketUpgrade => builder.build_websocket_with_upgrade().await?,
+        };
+
+        let inner_socket = InnerSocket::new(engine_client)?;
+        Ok(inner_socket)
+    }
+
+    fn engineio_builder(&self) -> Result<EngineIoClientBuilder> {
         let mut url = Url::parse(&self.address)?;
 
         if url.path() == "/" {
@@ -460,16 +474,10 @@ impl ClientBuilder {
         if let Some(headers) = &self.opening_headers {
             builder = builder.headers(headers.to_owned());
         }
-
-        let engine_client = match self.transport_type {
-            TransportType::Any => builder.build_with_fallback().await?,
-            TransportType::Polling => builder.build_polling().await?,
-            TransportType::Websocket => builder.build_websocket().await?,
-            TransportType::WebsocketUpgrade => builder.build_websocket_with_upgrade().await?,
-        };
-
-        let inner_socket = InnerSocket::new(engine_client)?;
-        Ok(inner_socket)
+        if self.auth.is_some() {
+            builder = builder.credentials_present();
+        }
+        Ok(builder)
     }
 
     //TODO: 0.3.X stabilize
@@ -480,5 +488,20 @@ impl ClientBuilder {
         socket.connect().await?;
 
         Ok(socket)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn namespace_auth_marks_engineio_builder_credential_bearing() {
+        let builder = ClientBuilder::new("https://socket.example.test/socket.io/")
+            .auth(json!({"token": "local-fixture"}));
+
+        let engineio_builder = builder.engineio_builder().unwrap();
+        assert!(format!("{engineio_builder:?}").contains("has_credentials: true"));
     }
 }

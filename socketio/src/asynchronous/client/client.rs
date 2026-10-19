@@ -167,7 +167,8 @@ impl Client {
             }
 
             if let Some(auth) = reconnect_settings.auth {
-                self.auth = Some(auth);
+                self.auth = Some(auth.clone());
+                builder.auth = Some(auth);
             }
 
             if reconnect_settings.headers.is_some() {

@@ -41,6 +41,17 @@ impl WebsocketTransport {
         headers: Option<HeaderMap>,
         redirect_budget: usize,
     ) -> Result<Self> {
+        Self::new_with_credentials_and_redirect_budget(base_url, headers, redirect_budget, false)
+            .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn new_with_credentials_and_redirect_budget(
+        base_url: Url,
+        headers: Option<HeaderMap>,
+        redirect_budget: usize,
+        credentials_present: bool,
+    ) -> Result<Self> {
         let mut url = base_url;
         set_query_param(&mut url, "transport", "websocket");
         match url.scheme() {
@@ -50,7 +61,8 @@ impl WebsocketTransport {
             scheme => return Err(crate::Error::InvalidUrlScheme(scheme.to_owned())),
         }
         let original_url = url.clone();
-        let credential_bearing = url.username() != ""
+        let credential_bearing = credentials_present
+            || url.username() != ""
             || url.password().is_some()
             || headers.as_ref().is_some_and(|headers| {
                 headers.contains_key(http::header::AUTHORIZATION)

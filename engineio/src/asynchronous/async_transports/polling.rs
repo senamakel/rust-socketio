@@ -31,6 +31,7 @@ pub struct PollingTransport {
     generator: StreamGenerator<Bytes>,
     opening_headers: Option<HeaderMap>,
     credential_origin: Url,
+    credentials_present: bool,
     redirect_budget: usize,
 }
 
@@ -38,6 +39,7 @@ pub struct PollingTransport {
 struct RedirectContext {
     opening_headers: Option<HeaderMap>,
     credential_origin: Url,
+    credentials_present: bool,
     redirects: Arc<StdMutex<Vec<RedirectMetadata>>>,
     budget: usize,
 }
@@ -59,11 +61,42 @@ impl PollingTransport {
         Self::new_with_redirect_budget(base_url, tls_config, opening_headers, 3)
     }
 
+    pub(crate) fn new_with_credentials(
+        base_url: Url,
+        tls_config: Option<TlsConnector>,
+        opening_headers: Option<HeaderMap>,
+        credentials_present: bool,
+    ) -> Self {
+        Self::new_with_redirect_budget_and_credentials(
+            base_url,
+            tls_config,
+            opening_headers,
+            3,
+            credentials_present,
+        )
+    }
+
     pub(crate) fn new_with_redirect_budget(
         base_url: Url,
         tls_config: Option<TlsConnector>,
         opening_headers: Option<HeaderMap>,
         redirect_budget: usize,
+    ) -> Self {
+        Self::new_with_redirect_budget_and_credentials(
+            base_url,
+            tls_config,
+            opening_headers,
+            redirect_budget,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_redirect_budget_and_credentials(
+        base_url: Url,
+        tls_config: Option<TlsConnector>,
+        opening_headers: Option<HeaderMap>,
+        redirect_budget: usize,
+        credentials_present: bool,
     ) -> Self {
         let mut url = base_url;
         ensure_query_param(&mut url, "transport", "polling");
@@ -78,6 +111,7 @@ impl PollingTransport {
         let redirect_context = RedirectContext {
             opening_headers: opening_headers.clone(),
             credential_origin: original_url.clone(),
+            credentials_present,
             redirects: redirect_log.clone(),
             budget: redirect_budget,
         };
@@ -89,6 +123,7 @@ impl PollingTransport {
             generator: StreamGenerator::new(Self::stream(url, client, base_url, redirect_context)),
             opening_headers,
             credential_origin: original_url,
+            credentials_present,
             redirect_budget,
         }
     }
@@ -143,7 +178,8 @@ impl PollingTransport {
             if !matches!(to.scheme(), "http" | "https") {
                 return Err(Error::InvalidUrlScheme(to.scheme().to_owned()));
             }
-            if (credential_bearing_headers(&redirect_context.opening_headers)
+            if (redirect_context.credentials_present
+                || credential_bearing_headers(&redirect_context.opening_headers)
                 || !redirect_context.credential_origin.username().is_empty()
                 || redirect_context.credential_origin.password().is_some())
                 && redirect_target_error(&from, &to, true).is_some()
@@ -244,6 +280,7 @@ impl AsyncTransport for PollingTransport {
             RedirectContext {
                 opening_headers: self.opening_headers.clone(),
                 credential_origin: self.credential_origin.clone(),
+                credentials_present: self.credentials_present,
                 redirects: self.redirects.clone(),
                 budget: self.redirect_budget,
             },
