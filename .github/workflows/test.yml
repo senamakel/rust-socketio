@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, refactoring]
+    branches: [main, refactoring, epic/8089-test-ownership]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,18 +15,14 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Setup rust environment  
-        uses: actions-rs/toolchain@v1
-        with:
-             profile: minimal
-             toolchain: stable
-             override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Setup docker
         id: buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v3
 
       - name: Generate keys
         run: make keys
@@ -39,7 +35,7 @@ jobs:
       - name: Generate Cargo.lock
         run: cargo generate-lockfile
 
-      - uses: actions/cache@v2
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/bin/
