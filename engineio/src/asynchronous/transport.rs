@@ -7,6 +7,7 @@ use std::{pin::Pin, time::SystemTime};
 use url::Url;
 
 use super::async_transports::{PollingTransport, WebsocketSecureTransport, WebsocketTransport};
+use super::RedirectMetadata;
 
 #[async_trait]
 pub trait AsyncTransport: Stream<Item = Result<Bytes>> + Unpin {
@@ -20,6 +21,11 @@ pub trait AsyncTransport: Stream<Item = Result<Bytes>> + Unpin {
 
     /// Used to update the base path, like when adding the sid.
     async fn set_base_url(&self, base_url: Url) -> Result<()>;
+
+    /// Redirects followed while establishing this transport.
+    fn redirect_metadata(&self) -> Vec<RedirectMetadata> {
+        Vec::new()
+    }
 
     /// Full query address
     async fn address(&self) -> Result<Url>

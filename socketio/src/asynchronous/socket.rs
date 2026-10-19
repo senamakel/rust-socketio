@@ -8,7 +8,7 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use rust_engineio::{
-    asynchronous::{CallbackTaskControl, Client as EngineClient},
+    asynchronous::{CallbackTaskControl, Client as EngineClient, ConnectionMetadata},
     Packet as EnginePacket, PacketId as EnginePacketId,
 };
 use std::{
@@ -40,6 +40,10 @@ impl Socket {
 
     pub(crate) fn callback_task_control(&self) -> CallbackTaskControl {
         self.engine_client.callback_task_control()
+    }
+
+    pub(crate) fn connection_metadata(&self) -> ConnectionMetadata {
+        self.engine_client.connection_metadata().clone()
     }
 
     /// Connects to the server. This includes a connection of the underlying

@@ -1,8 +1,10 @@
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
-use crate::asynchronous::transport::AsyncTransport;
+use crate::asynchronous::{
+    redirect_target_error, set_query_param, transport::AsyncTransport, RedirectMetadata,
+};
 use crate::error::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,8 +13,8 @@ use futures_util::StreamExt;
 use http::HeaderMap;
 use native_tls::TlsConnector;
 use tokio::sync::RwLock;
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::Connector;
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Error as WsError};
 use tungstenite::client::IntoClientRequest;
 use url::Url;
 
@@ -25,6 +27,7 @@ use super::websocket_general::AsyncWebsocketGeneralTransport;
 pub struct WebsocketSecureTransport {
     inner: AsyncWebsocketGeneralTransport,
     base_url: Arc<RwLock<Url>>,
+    redirects: Arc<StdMutex<Vec<RedirectMetadata>>>,
 }
 
 impl WebsocketSecureTransport {
@@ -35,15 +38,35 @@ impl WebsocketSecureTransport {
         tls_config: Option<TlsConnector>,
         headers: Option<HeaderMap>,
     ) -> Result<Self> {
-        let mut url = base_url;
-        url.query_pairs_mut().append_pair("transport", "websocket");
-        url.set_scheme("wss").unwrap();
+        Self::new_with_redirect_budget(base_url, tls_config, headers, 3).await
+    }
 
-        let mut req = url.clone().into_client_request()?;
-        if let Some(map) = headers {
-            // SAFETY: this unwrap never panics as the underlying request is just initialized and in proper state
-            req.headers_mut().extend(map);
+    // Preserve the existing public Error representation for this additive
+    // internal constructor.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn new_with_redirect_budget(
+        base_url: Url,
+        tls_config: Option<TlsConnector>,
+        headers: Option<HeaderMap>,
+        redirect_budget: usize,
+    ) -> Result<Self> {
+        let mut url = base_url;
+        set_query_param(&mut url, "transport", "websocket");
+        match url.scheme() {
+            "http" => url.set_scheme("ws").unwrap(),
+            "https" => url.set_scheme("wss").unwrap(),
+            "ws" | "wss" => {}
+            scheme => return Err(crate::Error::InvalidUrlScheme(scheme.to_owned())),
         }
+        let original_url = url.clone();
+        let credential_bearing = url.username() != ""
+            || url.password().is_some()
+            || headers.as_ref().is_some_and(|headers| {
+                headers.contains_key(http::header::AUTHORIZATION)
+                    || headers.contains_key(http::header::COOKIE)
+                    || headers.contains_key(http::header::PROXY_AUTHORIZATION)
+            });
+        let mut redirects = Vec::new();
 
         // `disable_nagle` Sets the value of the TCP_NODELAY option on this socket.
         //
@@ -52,13 +75,59 @@ impl WebsocketSecureTransport {
         // When `false`, data is buffered until there is a sufficient amount to send out, thereby avoiding the frequent sending of small packets.
         //
         // See the docs: https://docs.rs/tokio/latest/tokio/net/struct.TcpStream.html#method.set_nodelay
-        let (ws_stream, _) = connect_async_tls_with_config(
-            req,
-            None,
-            /*disable_nagle=*/ false,
-            tls_config.map(Connector::NativeTls),
-        )
-        .await?;
+        let (ws_stream, _) = loop {
+            let mut req = url.clone().into_client_request()?;
+            if let Some(mut map) = headers.clone() {
+                if url.origin() != original_url.origin() {
+                    map.remove(http::header::AUTHORIZATION);
+                    map.remove(http::header::COOKIE);
+                    map.remove(http::header::PROXY_AUTHORIZATION);
+                }
+                req.headers_mut().extend(map);
+            }
+            match connect_async_tls_with_config(
+                req,
+                None,
+                /*disable_nagle=*/ false,
+                tls_config.clone().map(Connector::NativeTls),
+            )
+            .await
+            {
+                Ok(connection) => break connection,
+                Err(WsError::Http(response))
+                    if matches!(response.status().as_u16(), 301 | 302 | 307 | 308) =>
+                {
+                    if redirects.len() >= redirect_budget {
+                        return Err(WsError::Http(response).into());
+                    }
+                    let location = response
+                        .headers()
+                        .get(http::header::LOCATION)
+                        .and_then(|value| value.to_str().ok())
+                        .ok_or_else(|| {
+                            crate::Error::InvalidHandshake("redirect missing Location".into())
+                        })?;
+                    let from = url.clone();
+                    let mut to = url.join(location)?;
+                    if let Some(reason) = redirect_target_error(&from, &to, credential_bearing) {
+                        return Err(crate::Error::InvalidHandshake(reason.into()));
+                    }
+                    match to.scheme() {
+                        "http" => to.set_scheme("ws").unwrap(),
+                        "https" => to.set_scheme("wss").unwrap(),
+                        "ws" | "wss" => {}
+                        scheme => return Err(crate::Error::InvalidUrlScheme(scheme.to_owned())),
+                    }
+                    redirects.push(RedirectMetadata {
+                        status: response.status().as_u16(),
+                        from,
+                        to: to.clone(),
+                    });
+                    url = to;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
 
         let (sen, rec) = ws_stream.split();
         let inner = AsyncWebsocketGeneralTransport::new(sen, rec).await;
@@ -66,6 +135,7 @@ impl WebsocketSecureTransport {
         Ok(WebsocketSecureTransport {
             inner,
             base_url: Arc::new(RwLock::new(url)),
+            redirects: Arc::new(StdMutex::new(redirects)),
         })
     }
 
@@ -103,15 +173,19 @@ impl AsyncTransport for WebsocketSecureTransport {
 
     async fn set_base_url(&self, base_url: Url) -> Result<()> {
         let mut url = base_url;
-        if !url
-            .query_pairs()
-            .any(|(k, v)| k == "transport" && v == "websocket")
-        {
-            url.query_pairs_mut().append_pair("transport", "websocket");
+        set_query_param(&mut url, "transport", "websocket");
+        if matches!(url.scheme(), "http" | "https" | "ws") {
+            url.set_scheme("wss").unwrap();
         }
-        url.set_scheme("wss").unwrap();
         *self.base_url.write().await = url;
         Ok(())
+    }
+
+    fn redirect_metadata(&self) -> Vec<RedirectMetadata> {
+        self.redirects
+            .lock()
+            .map(|redirects| redirects.clone())
+            .unwrap_or_default()
     }
 }
 

@@ -6,14 +6,19 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 use http::HeaderMap;
 use native_tls::TlsConnector;
-use reqwest::{Client, ClientBuilder, Response};
+use reqwest::{redirect::Policy, Client, ClientBuilder, Method, Response};
 use std::fmt::Debug;
 use std::time::SystemTime;
-use std::{pin::Pin, sync::Arc};
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex as StdMutex},
+};
 use tokio::sync::RwLock;
 use url::Url;
 
 use crate::asynchronous::generator::StreamGenerator;
+use crate::asynchronous::RedirectMetadata;
+use crate::asynchronous::{ensure_query_param, redirect_target_error};
 use crate::{asynchronous::transport::AsyncTransport, error::Result, Error};
 
 /// An asynchronous polling type. Makes use of the nonblocking reqwest types and
@@ -22,7 +27,27 @@ use crate::{asynchronous::transport::AsyncTransport, error::Result, Error};
 pub struct PollingTransport {
     client: Client,
     base_url: Arc<RwLock<Url>>,
+    redirects: Arc<StdMutex<Vec<RedirectMetadata>>>,
     generator: StreamGenerator<Bytes>,
+    opening_headers: Option<HeaderMap>,
+    credential_origin: Url,
+    redirect_budget: usize,
+}
+
+#[derive(Clone)]
+struct RedirectContext {
+    opening_headers: Option<HeaderMap>,
+    credential_origin: Url,
+    redirects: Arc<StdMutex<Vec<RedirectMetadata>>>,
+    budget: usize,
+}
+
+fn credential_bearing_headers(headers: &Option<HeaderMap>) -> bool {
+    headers.as_ref().is_some_and(|headers| {
+        headers.contains_key(http::header::AUTHORIZATION)
+            || headers.contains_key(http::header::COOKIE)
+            || headers.contains_key(http::header::PROXY_AUTHORIZATION)
+    })
 }
 
 impl PollingTransport {
@@ -31,27 +56,40 @@ impl PollingTransport {
         tls_config: Option<TlsConnector>,
         opening_headers: Option<HeaderMap>,
     ) -> Self {
-        let client = match (tls_config, opening_headers) {
-            (Some(config), Some(map)) => ClientBuilder::new()
-                .use_preconfigured_tls(config)
-                .default_headers(map)
-                .build()
-                .unwrap(),
-            (Some(config), None) => ClientBuilder::new()
-                .use_preconfigured_tls(config)
-                .build()
-                .unwrap(),
-            (None, Some(map)) => ClientBuilder::new().default_headers(map).build().unwrap(),
-            (None, None) => Client::new(),
-        };
+        Self::new_with_redirect_budget(base_url, tls_config, opening_headers, 3)
+    }
 
+    pub(crate) fn new_with_redirect_budget(
+        base_url: Url,
+        tls_config: Option<TlsConnector>,
+        opening_headers: Option<HeaderMap>,
+        redirect_budget: usize,
+    ) -> Self {
         let mut url = base_url;
-        url.query_pairs_mut().append_pair("transport", "polling");
+        ensure_query_param(&mut url, "transport", "polling");
+        let original_url = url.clone();
+        let redirect_log = Arc::new(StdMutex::new(Vec::<RedirectMetadata>::new()));
+        let mut client_builder = ClientBuilder::new().redirect(Policy::none());
+        if let Some(config) = tls_config {
+            client_builder = client_builder.use_preconfigured_tls(config);
+        }
+        let client = client_builder.build().unwrap();
+        let base_url = Arc::new(RwLock::new(url.clone()));
+        let redirect_context = RedirectContext {
+            opening_headers: opening_headers.clone(),
+            credential_origin: original_url.clone(),
+            redirects: redirect_log.clone(),
+            budget: redirect_budget,
+        };
 
         PollingTransport {
             client: client.clone(),
-            base_url: Arc::new(RwLock::new(url.clone())),
-            generator: StreamGenerator::new(Self::stream(url, client)),
+            base_url: base_url.clone(),
+            redirects: redirect_log.clone(),
+            generator: StreamGenerator::new(Self::stream(url, client, base_url, redirect_context)),
+            opening_headers,
+            credential_origin: original_url,
+            redirect_budget,
         }
     }
 
@@ -62,24 +100,109 @@ impl PollingTransport {
         Ok(url)
     }
 
-    fn send_request(url: Url, client: Client) -> impl Stream<Item = Result<Response>> {
+    // Keep the existing public Error type intact; this internal request helper
+    // can produce its established, relatively large tungstenite error variant.
+    #[allow(clippy::result_large_err)]
+    async fn send_request(
+        mut url: Url,
+        client: Client,
+        redirect_context: RedirectContext,
+        mut method: Method,
+        mut body: Option<Bytes>,
+    ) -> Result<Response> {
+        let mut hops = 0;
+        loop {
+            let mut request = client.request(method.clone(), url.clone());
+            if let Some(mut headers) = redirect_context.opening_headers.clone() {
+                if url.origin() != redirect_context.credential_origin.origin() {
+                    headers.remove(http::header::AUTHORIZATION);
+                    headers.remove(http::header::COOKIE);
+                    headers.remove(http::header::PROXY_AUTHORIZATION);
+                }
+                request = request.headers(headers);
+            }
+            if let Some(payload) = body.clone() {
+                request = request.body(payload);
+            }
+            let response = request.send().await?;
+            if !matches!(response.status().as_u16(), 301 | 302 | 307 | 308) {
+                return Ok(response);
+            }
+            if hops >= redirect_context.budget {
+                return Err(Error::InvalidHandshake(
+                    "redirect hop limit exceeded".into(),
+                ));
+            }
+            let location = response
+                .headers()
+                .get(http::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| Error::InvalidHandshake("redirect missing Location".into()))?;
+            let from = response.url().clone();
+            let to = from.join(location)?;
+            if !matches!(to.scheme(), "http" | "https") {
+                return Err(Error::InvalidUrlScheme(to.scheme().to_owned()));
+            }
+            if (credential_bearing_headers(&redirect_context.opening_headers)
+                || !redirect_context.credential_origin.username().is_empty()
+                || redirect_context.credential_origin.password().is_some())
+                && redirect_target_error(&from, &to, true).is_some()
+            {
+                return Err(Error::InvalidHandshake(
+                    "refusing credential-bearing TLS downgrade".into(),
+                ));
+            }
+            if let Ok(mut items) = redirect_context.redirects.lock() {
+                items.push(RedirectMetadata {
+                    status: response.status().as_u16(),
+                    from,
+                    to: to.clone(),
+                });
+            }
+            hops += 1;
+            if matches!(response.status().as_u16(), 301 | 302) && method == Method::POST {
+                method = Method::GET;
+                body = None;
+            }
+            url = to;
+        }
+    }
+
+    fn send_request_stream(
+        url: Url,
+        client: Client,
+        redirect_context: RedirectContext,
+    ) -> impl Stream<Item = Result<Response>> {
         try_stream! {
             let address = Self::address(url);
-
-            yield client
-                .get(address?)
-                .send().await?
+            yield Self::send_request(address?, client, redirect_context, Method::GET, None).await?
         }
     }
 
     fn stream(
-        url: Url,
+        mut url: Url,
         client: Client,
+        base_url: Arc<RwLock<Url>>,
+        redirect_context: RedirectContext,
     ) -> Pin<Box<dyn Stream<Item = Result<Bytes>> + 'static + Send>> {
         Box::pin(try_stream! {
             loop {
-                for await elem in Self::send_request(url.clone(), client.clone()) {
-                    for await bytes in elem?.bytes_stream() {
+                for await elem in Self::send_request_stream(url.clone(), client.clone(), redirect_context.clone()) {
+                let response = elem?;
+                if !response.status().is_success() {
+                    Err(Error::IncompleteHttp(response.status().as_u16()))?;
+                }
+                let query = response
+                    .url()
+                    .query_pairs()
+                    .filter(|(key, _)| key != "t")
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect::<Vec<_>>();
+                url = response.url().clone();
+                url.set_query(None);
+                url.query_pairs_mut().extend_pairs(query);
+                *base_url.write().await = url.clone();
+                for await bytes in response.bytes_stream() {
                         yield bytes?;
                     }
                 }
@@ -115,14 +238,21 @@ impl AsyncTransport for PollingTransport {
             data
         };
 
-        let status = self
-            .client
-            .post(self.address().await?)
-            .body(data_to_send)
-            .send()
-            .await?
-            .status()
-            .as_u16();
+        let status = Self::send_request(
+            self.address().await?,
+            self.client.clone(),
+            RedirectContext {
+                opening_headers: self.opening_headers.clone(),
+                credential_origin: self.credential_origin.clone(),
+                redirects: self.redirects.clone(),
+                budget: self.redirect_budget,
+            },
+            Method::POST,
+            Some(data_to_send),
+        )
+        .await?
+        .status()
+        .as_u16();
 
         if status != 200 {
             let error = Error::IncompleteHttp(status);
@@ -147,6 +277,13 @@ impl AsyncTransport for PollingTransport {
         *self.base_url.write().await = url;
         Ok(())
     }
+
+    fn redirect_metadata(&self) -> Vec<RedirectMetadata> {
+        self.redirects
+            .lock()
+            .map(|redirects| redirects.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl Debug for PollingTransport {
@@ -163,7 +300,12 @@ mod test {
     use crate::asynchronous::transport::AsyncTransport;
 
     use super::*;
+    use futures_util::StreamExt;
     use std::str::FromStr;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[tokio::test]
     async fn polling_transport_base_url() -> Result<()> {
@@ -191,5 +333,104 @@ mod test {
         );
         assert_ne!(transport.base_url().await?.to_string(), url);
         Ok(())
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut chunk = [0; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(
+                count, 0,
+                "fixture peer closed before sending request headers"
+            );
+            request.extend_from_slice(&chunk[..count]);
+        }
+    }
+
+    #[tokio::test]
+    async fn follows_relative_redirects_with_supported_statuses_and_reports_metadata() {
+        for status in [301, 302, 307, 308] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut redirect_stream, _) = listener.accept().await.unwrap();
+                read_request(&mut redirect_stream).await;
+                let redirect = format!(
+                    "HTTP/1.1 {status} Redirect\r\nLocation: /resolved/socket.io/?EIO=4&transport=polling&keep=yes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                redirect_stream
+                    .write_all(redirect.as_bytes())
+                    .await
+                    .unwrap();
+                drop(redirect_stream);
+
+                let (mut final_stream, _) = listener.accept().await.unwrap();
+                read_request(&mut final_stream).await;
+                let body = "0{\"sid\":\"redirected\",\"upgrades\":[],\"pingInterval\":60000,\"pingTimeout\":60000,\"maxPayload\":1000000}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                final_stream.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let original = Url::parse(&format!(
+                "http://{address}/initial/socket.io/?EIO=4&transport=polling"
+            ))
+            .unwrap();
+            let mut transport = PollingTransport::new(original, None, None);
+            let payload = transport.next().await.unwrap().unwrap();
+            assert!(String::from_utf8_lossy(&payload).contains("redirected"));
+            let final_url = transport.base_url().await.unwrap();
+            assert_eq!(final_url.path(), "/resolved/socket.io/");
+            assert!(final_url
+                .query_pairs()
+                .any(|(key, value)| key == "keep" && value == "yes"));
+            let redirects = transport.redirect_metadata();
+            assert_eq!(redirects.len(), 1);
+            assert_eq!(redirects[0].status, status);
+            assert_eq!(redirects[0].from.path(), "/initial/socket.io/");
+            assert_eq!(redirects[0].to.path(), "/resolved/socket.io/");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_redirect_chain_stops_after_three_hops() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for hop in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /hop{}/socket.io/?EIO=4&transport=polling\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    hop + 1
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let url = Url::parse(&format!("http://{address}/start/socket.io/")).unwrap();
+        let mut transport = PollingTransport::new(url, None, None);
+        assert!(transport.next().await.unwrap().is_err());
+        assert_eq!(transport.redirect_metadata().len(), 3);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn redirect_validation_rejects_unsupported_schemes_and_remote_credential_downgrade() {
+        let from = Url::parse("https://service.example/socket.io/").unwrap();
+        let plaintext = Url::parse("http://service.example/socket.io/").unwrap();
+        let unsupported = Url::parse("file:///tmp/socket.io/").unwrap();
+        assert_eq!(
+            redirect_target_error(&from, &unsupported, false),
+            Some("unsupported redirect scheme")
+        );
+        assert_eq!(
+            redirect_target_error(&from, &plaintext, true),
+            Some("refusing credential-bearing TLS downgrade")
+        );
+        assert_eq!(redirect_target_error(&from, &plaintext, false), None);
     }
 }

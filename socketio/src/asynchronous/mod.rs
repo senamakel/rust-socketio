@@ -4,7 +4,8 @@ mod socket;
 
 #[cfg(feature = "async")]
 pub use client::builder::ClientBuilder;
-pub use client::client::{Client, ManagedClient, ReconnectSettings};
+pub use client::client::{Client, ManagedClient, NamespaceConnectOutcome, ReconnectSettings};
+pub use rust_engineio::asynchronous::{ConnectionMetadata, RedirectMetadata};
 
 // re-export the macro
 pub use crate::{async_any_callback, async_callback};

@@ -14,7 +14,7 @@ use rand::{thread_rng, Rng};
 use rust_engineio::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use tokio::{
-    sync::{oneshot, RwLock},
+    sync::{oneshot, watch, RwLock},
     task::JoinHandle,
     time::{sleep, Duration, Instant},
 };
@@ -31,6 +31,7 @@ use crate::{
     CloseReason, Event, Payload,
 };
 use rust_engineio::asynchronous::CallbackTaskControl;
+use rust_engineio::asynchronous::ConnectionMetadata;
 
 #[derive(Default)]
 enum DisconnectReason {
@@ -100,6 +101,18 @@ pub struct Client {
     disconnect_reason: Arc<RwLock<DisconnectReason>>,
     callback_tasks: Arc<StdMutex<CallbackTaskControl>>,
     shutdown_requested: Arc<AtomicBool>,
+    namespace_result_tx: watch::Sender<Option<NamespaceConnectOutcome>>,
+}
+
+/// The server's response to the managed client's Socket.IO namespace handshake.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NamespaceConnectOutcome {
+    /// The namespace accepted the connection.
+    Ready { sid: Option<String> },
+    /// The namespace rejected the connection with its original payload.
+    Rejected { payload: Value },
+    /// The connection closed before the namespace accepted or rejected it.
+    Closed,
 }
 
 impl Client {
@@ -109,6 +122,7 @@ impl Client {
     /// ```
     pub(crate) fn new(socket: InnerSocket, builder: ClientBuilder) -> Result<Self> {
         let callback_tasks = socket.callback_task_control();
+        let (namespace_result_tx, _) = watch::channel(None);
         Ok(Client {
             socket: Arc::new(RwLock::new(socket)),
             nsp: builder.namespace.to_owned(),
@@ -118,6 +132,7 @@ impl Client {
             disconnect_reason: Arc::new(RwLock::new(DisconnectReason::default())),
             callback_tasks: Arc::new(StdMutex::new(callback_tasks)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            namespace_result_tx,
         })
     }
 
@@ -134,6 +149,11 @@ impl Client {
         self.socket.read().await.send(open_packet).await?;
 
         Ok(())
+    }
+
+    /// Returns the resolved Engine.IO endpoint and redirects used to connect.
+    pub async fn connection_metadata(&self) -> ConnectionMetadata {
+        self.socket.read().await.connection_metadata()
     }
 
     pub(crate) async fn reconnect(&mut self) -> Result<()> {
@@ -289,6 +309,11 @@ impl Client {
                         }
                     }
                 }
+            }
+            if client_clone.namespace_result_tx.borrow().is_none() {
+                client_clone
+                    .namespace_result_tx
+                    .send_replace(Some(NamespaceConnectOutcome::Closed));
             }
         });
 
@@ -623,6 +648,18 @@ impl Client {
                 }
                 PacketId::Connect => {
                     *(self.disconnect_reason.write().await) = DisconnectReason::default();
+                    let sid = packet
+                        .data
+                        .as_deref()
+                        .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+                        .and_then(|payload| {
+                            payload
+                                .get("sid")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        });
+                    self.namespace_result_tx
+                        .send_replace(Some(NamespaceConnectOutcome::Ready { sid }));
                     self.callback(&Event::Connect, "").await?;
                 }
                 PacketId::Disconnect => {
@@ -631,6 +668,16 @@ impl Client {
                         .await?;
                 }
                 PacketId::ConnectError => {
+                    let payload = packet
+                        .data
+                        .as_deref()
+                        .map(|payload| {
+                            serde_json::from_str(payload)
+                                .unwrap_or_else(|_| Value::String(payload.to_owned()))
+                        })
+                        .unwrap_or(Value::Null);
+                    self.namespace_result_tx
+                        .send_replace(Some(NamespaceConnectOutcome::Rejected { payload }));
                     self.callback(
                         &Event::Error,
                         String::from("Received an ConnectError frame: ")
@@ -706,6 +753,7 @@ async fn select_or_stop<T, F: std::future::Future<Output = T>>(
 /// Call [`shutdown`](Self::shutdown) when the caller can await completion.
 pub struct ManagedClient {
     client: Client,
+    namespace_result_rx: watch::Receiver<Option<NamespaceConnectOutcome>>,
     stop_tx: Option<oneshot::Sender<()>>,
     poll_task: Option<JoinHandle<()>>,
     closed: bool,
@@ -718,11 +766,32 @@ impl ManagedClient {
         poll_task: JoinHandle<()>,
     ) -> Self {
         Self {
+            namespace_result_rx: client.namespace_result_tx.subscribe(),
             client,
             stop_tx: Some(stop_tx),
             poll_task: Some(poll_task),
             closed: false,
         }
+    }
+
+    /// Wait until the server accepts or rejects this client's namespace.
+    ///
+    /// This can be canceled and awaited again later; the handshake result is
+    /// retained in the managed connection handle.
+    pub async fn wait_for_namespace(&mut self) -> NamespaceConnectOutcome {
+        loop {
+            if let Some(outcome) = self.namespace_result_rx.borrow().clone() {
+                return outcome;
+            }
+            if self.namespace_result_rx.changed().await.is_err() {
+                return NamespaceConnectOutcome::Closed;
+            }
+        }
+    }
+
+    /// Returns the resolved endpoint and redirects used during connection setup.
+    pub async fn connection_metadata(&self) -> ConnectionMetadata {
+        self.client.connection_metadata().await
     }
 
     /// Signal shutdown, close the transport, and wait until polling, reconnect,
@@ -976,6 +1045,239 @@ mod test {
         )
     }
 
+    async fn local_namespace_rejection_fixture() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    "0{\"sid\":\"fixture\",\"upgrades\":[],\"pingInterval\":60000,\"pingTimeout\":60000,\"maxPayload\":1000000}".into(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Text(ref text) if text == "1") {
+                    break;
+                }
+                if matches!(message, Message::Text(ref text) if text.starts_with("40")) {
+                    socket
+                        .send(Message::Text(
+                            "44{\"message\":\"forbidden\",\"retry\":false}".into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+
+    async fn local_delayed_namespace_ready_fixture() -> (
+        String,
+        oneshot::Receiver<()>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (connect_seen_tx, connect_seen_rx) = oneshot::channel();
+        let (release_ready_tx, release_ready_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    "0{\"sid\":\"fixture\",\"upgrades\":[],\"pingInterval\":60000,\"pingTimeout\":60000,\"maxPayload\":1000000}".into(),
+                ))
+                .await
+                .unwrap();
+            let mut connect_seen_tx = Some(connect_seen_tx);
+            let mut release_ready_rx = Some(release_ready_rx);
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Text(ref text) if text.starts_with("40")) {
+                    if let Some(connect_seen_tx) = connect_seen_tx.take() {
+                        let _ = connect_seen_tx.send(());
+                        let _ = release_ready_rx.take().unwrap().await;
+                        socket
+                            .send(Message::Text("40{\"sid\":\"delayed-sid\"}".into()))
+                            .await
+                            .unwrap();
+                    }
+                } else if matches!(message, Message::Text(ref text) if text == "1") {
+                    break;
+                }
+            }
+        });
+        (
+            format!("http://{address}"),
+            connect_seen_rx,
+            release_ready_tx,
+            server,
+        )
+    }
+
+    async fn local_namespace_closes_before_ack_fixture(
+    ) -> (String, oneshot::Receiver<()>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (connect_seen_tx, connect_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    "0{\"sid\":\"fixture\",\"upgrades\":[],\"pingInterval\":60000,\"pingTimeout\":60000,\"maxPayload\":1000000}".into(),
+                ))
+                .await
+                .unwrap();
+            let mut connect_seen_tx = Some(connect_seen_tx);
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Text(ref text) if text.starts_with("40")) {
+                    if let Some(connect_seen_tx) = connect_seen_tx.take() {
+                        let _ = connect_seen_tx.send(());
+                    }
+                    break;
+                }
+            }
+        });
+        (format!("http://{address}"), connect_seen_rx, server)
+    }
+
+    async fn local_namespace_waits_for_shutdown_fixture(
+    ) -> (String, oneshot::Receiver<()>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (connect_seen_tx, connect_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    "0{\"sid\":\"fixture\",\"upgrades\":[],\"pingInterval\":60000,\"pingTimeout\":60000,\"maxPayload\":1000000}".into(),
+                ))
+                .await
+                .unwrap();
+            let mut connect_seen_tx = Some(connect_seen_tx);
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Text(ref text) if text.starts_with("40")) {
+                    if let Some(connect_seen_tx) = connect_seen_tx.take() {
+                        let _ = connect_seen_tx.send(());
+                    }
+                } else if matches!(message, Message::Text(ref text) if text == "1") {
+                    break;
+                }
+            }
+        });
+        (format!("http://{address}"), connect_seen_rx, server)
+    }
+
+    async fn local_redirected_socketio_fixture() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut redirect_stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = redirect_stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            redirect_stream
+                .write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /resolved/socket.io/?EIO=4&transport=websocket\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            drop(redirect_stream);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    "0{\"sid\":\"redirected-engine\",\"upgrades\":[],\"pingInterval\":60000,\"pingTimeout\":60000,\"maxPayload\":1000000}".into(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Text(ref text) if text.starts_with("40")) {
+                    socket
+                        .send(Message::Text("40{\"sid\":\"redirected-namespace\"}".into()))
+                        .await
+                        .unwrap();
+                } else if matches!(message, Message::Text(ref text) if text == "1") {
+                    break;
+                }
+            }
+        });
+        (
+            format!("http://{address}/socket.io/?EIO=4&transport=websocket"),
+            server,
+        )
+    }
+
+    async fn local_managed_payload_fixture(
+    ) -> (String, oneshot::Receiver<()>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ack_seen_tx, ack_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    "0{\"sid\":\"fixture\",\"upgrades\":[],\"pingInterval\":60000,\"pingTimeout\":60000,\"maxPayload\":1000000}".into(),
+                ))
+                .await
+                .unwrap();
+            let mut sent_events = false;
+            let mut ack_seen_tx = Some(ack_seen_tx);
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Text(text) if text.starts_with("40") => {
+                        socket
+                            .send(Message::Text("40{\"sid\":\"managed-sid\"}".into()))
+                            .await
+                            .unwrap();
+                        if !sent_events {
+                            sent_events = true;
+                            socket
+                                .send(Message::Text("42[\"managed-json\",{\"value\":7}]".into()))
+                                .await
+                                .unwrap();
+                            socket
+                                .send(Message::Text(
+                                    "451-[\"managed-binary\",{\"_placeholder\":true,\"num\":0}]"
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            socket.send(Message::Binary(vec![7, 8, 9])).await.unwrap();
+                        }
+                    }
+                    Message::Text(text) if text.starts_with("42") => {
+                        let ack_id = text[2..]
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect::<String>();
+                        if !ack_id.is_empty() {
+                            socket
+                                .send(Message::Text(format!("43{ack_id}[{{\"accepted\":true}}]")))
+                                .await
+                                .unwrap();
+                            if let Some(ack_seen_tx) = ack_seen_tx.take() {
+                                let _ = ack_seen_tx.send(());
+                            }
+                        }
+                    }
+                    Message::Text(text) if text == "1" => break,
+                    _ => {}
+                }
+            }
+        });
+        (format!("http://{address}"), ack_seen_rx, server)
+    }
+
     #[tokio::test]
     async fn socket_io_integration() -> Result<()> {
         let url = crate::test::socket_io_server();
@@ -1086,6 +1388,15 @@ mod test {
             .await
             .expect("managed connection should establish");
 
+        assert_eq!(
+            timeout(Duration::from_secs(2), client.wait_for_namespace())
+                .await
+                .expect("namespace handshake should complete"),
+            super::NamespaceConnectOutcome::Ready {
+                sid: Some("fixture-namespace".to_owned())
+            }
+        );
+
         namespace_ready
             .await
             .expect("fixture should accept namespace");
@@ -1107,6 +1418,252 @@ mod test {
         assert!(late_event_sent, "fixture should release the stale event");
         assert_eq!(late_events.load(Ordering::Acquire), 0);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_namespace_rejection_preserves_structured_payload() {
+        let (url, server) = local_namespace_rejection_fixture().await;
+        let mut client = ClientBuilder::new(url)
+            .reconnect(false)
+            .transport_type(TransportType::Websocket)
+            .connect_managed()
+            .await
+            .expect("Engine.IO connection should establish");
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), client.wait_for_namespace())
+                .await
+                .expect("namespace rejection should arrive"),
+            super::NamespaceConnectOutcome::Rejected {
+                payload: json!({"message": "forbidden", "retry": false})
+            }
+        );
+        timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .expect("managed shutdown should complete")
+            .unwrap();
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fixture server should close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_namespace_wait_can_resume_after_server_accepts() {
+        let (url, connect_seen, release_ready, server) =
+            local_delayed_namespace_ready_fixture().await;
+        let mut client = ClientBuilder::new(url)
+            .reconnect(false)
+            .transport_type(TransportType::Websocket)
+            .connect_managed()
+            .await
+            .expect("Engine.IO connection should establish");
+        connect_seen
+            .await
+            .expect("fixture should receive namespace CONNECT");
+
+        let mut waiting = Box::pin(client.wait_for_namespace());
+        tokio::select! {
+            biased;
+            result = &mut waiting => panic!("namespace result arrived before fixture release: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(waiting);
+        release_ready.send(()).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), client.wait_for_namespace())
+                .await
+                .expect("a later waiter should observe the retained result"),
+            super::NamespaceConnectOutcome::Ready {
+                sid: Some("delayed-sid".to_owned())
+            }
+        );
+        timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .expect("managed shutdown should complete")
+            .unwrap();
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fixture should observe close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn namespace_wait_returns_closed_when_peer_closes_before_ack() {
+        let (url, connect_seen, server) = local_namespace_closes_before_ack_fixture().await;
+        let mut client = ClientBuilder::new(url)
+            .reconnect(false)
+            .transport_type(TransportType::Websocket)
+            .connect_managed()
+            .await
+            .expect("Engine.IO connection should establish");
+        timeout(Duration::from_secs(2), connect_seen)
+            .await
+            .expect("fixture should receive namespace CONNECT")
+            .expect("fixture notification should be sent");
+        assert_eq!(
+            timeout(Duration::from_secs(2), client.wait_for_namespace())
+                .await
+                .expect("terminal peer close should finish namespace wait"),
+            super::NamespaceConnectOutcome::Closed
+        );
+        drop(client);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fixture should close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn namespace_wait_returns_closed_after_managed_shutdown() {
+        let (url, connect_seen, server) = local_namespace_waits_for_shutdown_fixture().await;
+        let mut client = ClientBuilder::new(url)
+            .reconnect(false)
+            .transport_type(TransportType::Websocket)
+            .connect_managed()
+            .await
+            .expect("Engine.IO connection should establish");
+        timeout(Duration::from_secs(2), connect_seen)
+            .await
+            .expect("fixture should receive namespace CONNECT")
+            .expect("fixture notification should be sent");
+        timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .expect("managed shutdown should complete")
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), client.wait_for_namespace())
+                .await
+                .expect("shutdown should finish namespace wait"),
+            super::NamespaceConnectOutcome::Closed
+        );
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fixture should close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_websocket_connect_exposes_redirect_metadata_and_namespace_sid() {
+        let (url, server) = local_redirected_socketio_fixture().await;
+        let mut client = ClientBuilder::new(url.clone())
+            .reconnect(false)
+            .transport_type(TransportType::Websocket)
+            .connect_managed()
+            .await
+            .expect("managed websocket should follow the local redirect");
+        assert_eq!(
+            timeout(Duration::from_secs(2), client.wait_for_namespace())
+                .await
+                .expect("namespace ack should be surfaced"),
+            super::NamespaceConnectOutcome::Ready {
+                sid: Some("redirected-namespace".to_owned())
+            }
+        );
+        let metadata = client.connection_metadata().await;
+        assert_eq!(metadata.original_endpoint.as_str(), url);
+        assert_eq!(metadata.final_endpoint.path(), "/resolved/socket.io/");
+        assert_eq!(metadata.redirects.len(), 1);
+        assert_eq!(metadata.redirects[0].status, 307);
+        assert_eq!(metadata.redirects[0].from.path(), "/socket.io/");
+        assert_eq!(metadata.redirects[0].to.path(), "/resolved/socket.io/");
+        timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .expect("managed client should shut down")
+            .unwrap();
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fixture should observe the close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_client_preserves_json_binary_events_and_acknowledgements() {
+        let (url, ack_seen, server) = local_managed_payload_fixture().await;
+        let (json_tx, mut json_rx) = mpsc::channel(1);
+        let (binary_tx, mut binary_rx) = mpsc::channel(1);
+        let json_tx = Arc::new(json_tx);
+        let binary_tx = Arc::new(binary_tx);
+        let json_callback_tx = json_tx.clone();
+        let binary_callback_tx = binary_tx.clone();
+        let mut client = ClientBuilder::new(url)
+            .reconnect(false)
+            .transport_type(TransportType::Websocket)
+            .on("managed-json", move |payload, _| {
+                let tx = json_callback_tx.clone();
+                async move {
+                    let _ = tx.send(payload).await;
+                }
+                .boxed()
+            })
+            .on("managed-binary", move |payload, _| {
+                let tx = binary_callback_tx.clone();
+                async move {
+                    let _ = tx.send(payload).await;
+                }
+                .boxed()
+            })
+            .connect_managed()
+            .await
+            .expect("managed connection should establish");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), client.wait_for_namespace())
+                .await
+                .expect("namespace should be ready"),
+            super::NamespaceConnectOutcome::Ready { .. }
+        ));
+        let json_payload = timeout(Duration::from_secs(2), json_rx.recv())
+            .await
+            .expect("JSON event should arrive")
+            .expect("JSON callback should be open");
+        assert!(
+            matches!(json_payload, Payload::Text(values) if values == vec![json!({"value": 7})])
+        );
+        let binary_payload = timeout(Duration::from_secs(2), binary_rx.recv())
+            .await
+            .expect("binary event should arrive")
+            .expect("binary callback should be open");
+        assert!(matches!(binary_payload, Payload::Binary(bytes) if bytes.as_ref() == [7, 8, 9]));
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let ack_tx = Arc::new(Mutex::new(Some(ack_tx)));
+        let callback_ack_tx = ack_tx.clone();
+        client
+            .emit_with_ack(
+                "managed-out",
+                json!({"value": 9}),
+                Duration::from_secs(2),
+                move |payload, _| {
+                    let tx = callback_ack_tx.clone();
+                    async move {
+                        if let Some(tx) = tx.lock().await.take() {
+                            let _ = tx.send(payload);
+                        }
+                    }
+                    .boxed()
+                },
+            )
+            .await
+            .expect("managed client should send an acked event");
+        let ack_payload = timeout(Duration::from_secs(2), ack_rx)
+            .await
+            .expect("server ACK callback should run")
+            .expect("ack callback should send its payload");
+        assert!(
+            matches!(ack_payload, Payload::Text(values) if values == vec![json!([{"accepted": true}])])
+        );
+        timeout(Duration::from_secs(2), ack_seen)
+            .await
+            .expect("fixture should observe the acked event")
+            .expect("fixture ack signal should be sent");
+        timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .expect("managed shutdown should complete")
+            .unwrap();
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fixture should close")
+            .unwrap();
     }
 
     #[tokio::test]

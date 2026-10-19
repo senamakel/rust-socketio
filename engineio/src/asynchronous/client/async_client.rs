@@ -3,6 +3,7 @@ use std::{fmt::Debug, pin::Pin};
 use crate::{
     asynchronous::{
         async_socket::Socket as InnerSocket, generator::StreamGenerator, CallbackTaskControl,
+        ConnectionMetadata,
     },
     error::Result,
     Packet,
@@ -21,14 +22,21 @@ use futures_util::{Stream, StreamExt};
 pub struct Client {
     pub(super) socket: InnerSocket,
     generator: StreamGenerator<Packet>,
+    connection_metadata: ConnectionMetadata,
 }
 
 impl Client {
-    pub(super) fn new(socket: InnerSocket) -> Self {
+    pub(super) fn new(socket: InnerSocket, connection_metadata: ConnectionMetadata) -> Self {
         Client {
             socket: socket.clone(),
             generator: StreamGenerator::new(Self::stream(socket)),
+            connection_metadata,
         }
+    }
+
+    /// Returns the resolved endpoint and redirects used during connection setup.
+    pub fn connection_metadata(&self) -> &ConnectionMetadata {
+        &self.connection_metadata
     }
 
     pub async fn close(&self) -> Result<()> {
